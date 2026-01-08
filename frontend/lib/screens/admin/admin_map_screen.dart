@@ -24,7 +24,7 @@ class _AdminMapScreenState extends State<AdminMapScreen>
   Map<String, Map<String, dynamic>> _employeeData = {};
   Map<String, AnimationController> _pulseAnimations = {};
   bool _isLoading = true;
-  bool _isRefreshing = false; // ✅ NEW: Prevent concurrent loads
+  bool _isRefreshing = false;
   int _checkedInCount = 0;
 
   Timer? _refreshTimer;
@@ -70,13 +70,18 @@ class _AdminMapScreenState extends State<AdminMapScreen>
           print('📍 Status update: ${data['type']} - ${data['employeeName']}');
           _handleEmployeeUpdate(data);
         });
+
+        _socketService.socket?.on('location_update', (data) {
+          print('📍 Location update: ${data['employeeName']}');
+          _handleEmployeeUpdate(data);
+        });
       }
     } catch (e) {
       print('❌ Socket connection error: $e');
     }
   }
 
-  // ✅ FIX: Auto-refresh every 30 seconds (not 5)
+  // Auto-refresh every 15 seconds
   void _startAutoRefresh() {
     _refreshTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
       if (!_isLoading && !_isRefreshing) {
@@ -92,124 +97,120 @@ class _AdminMapScreenState extends State<AdminMapScreen>
 
     final type = data['type'];
     final employeeId = data['employeeId'];
+    final latitude = data['latitude'];
+    final longitude = data['longitude'];
+
+    if (latitude == null || longitude == null) return;
 
     setState(() {
       if (type == 'REACHED_OFFICE' || type == 'CHECKED_OUT') {
+        // Remove employee marker
         _employeeData.remove(employeeId);
-        _employeeMarkers
-            .removeWhere((m) => m.key.toString().contains(employeeId));
+        _employeeMarkers.removeWhere(
+          (m) => m.key.toString().contains(employeeId),
+        );
         _pulseAnimations[employeeId]?.dispose();
         _pulseAnimations.remove(employeeId);
-        _checkedInCount = _employeeMarkers.length;
+        _checkedInCount = _employeeData.length;
       } else if (type == 'CHECKED_IN' || type == 'LOCATION_UPDATE') {
+        // Update or add employee marker
         if (data['hasReachedOffice'] != true) {
           _employeeData[employeeId] = data;
+          _createPulseAnimation(employeeId);
           _updateEmployeeMarkerSmooth(data);
+          _checkedInCount = _employeeData.length;
         }
       }
     });
   }
 
-  // ✅ FIX: Load checked-in employees with proper state management
+  // Load checked-in employees
   Future<void> _loadCheckedInEmployees() async {
-    if (_isRefreshing) {
-      print('⏭️ Already refreshing, skipping...');
-      return;
-    }
+    if (_isLoading && _isRefreshing) return;
 
     setState(() {
-      _isRefreshing = true;
-      if (_employeeMarkers.isEmpty) {
-        _isLoading = true; // Only show loading on first load
+      if (_isLoading) {
+        _isLoading = true;
+      } else {
+        _isRefreshing = true;
       }
     });
 
     try {
       print('🔄 Loading checked-in employees...');
-      final employees = await _apiService.getCheckedInEmployees();
-      print('✅ Received ${employees.length} employees');
 
-      if (!mounted) return;
+      final employeesData = await _apiService.getCheckedInEmployees();
 
-      // Clear old data
-      final oldEmployeeIds = _employeeData.keys.toSet();
-      final newEmployeeIds = <String>{};
+      print('✅ Received ${employeesData.length} employees');
 
-      // Process new data
-      for (var emp in employees) {
+      final markers = <Marker>[];
+      _employeeData.clear();
+
+      for (var empData in employeesData) {
         try {
-          final employee = emp['employee'];
-          final location = emp['location'];
-          final attendance = emp['attendance'];
+          final emp = empData as Map<String, dynamic>;
+          final employeeInfo = emp['employee'] as Map<String, dynamic>;
+          final name = employeeInfo['name'] as String? ?? 'Unknown';
 
-          if (location == null || location['isInOffice'] == true) {
-            continue;
-          }
+          print('🔍 Processing employee: $name');
 
-          final employeeId = employee['_id'] as String;
-          newEmployeeIds.add(employeeId);
+          final lat = emp['latitude'] as double?;
+          final lng = emp['longitude'] as double?;
 
-          final data = {
-            'employeeId': employeeId,
-            'employeeName': employee['name'],
-            'employeeDepartment': employee['department'],
-            'latitude': location['latitude'],
-            'longitude': location['longitude'],
-            'address': location['address'],
-            'isInOffice': location['isInOffice'],
-            'checkInTime': attendance['checkInTime'],
-            'timestamp': location['timestamp'],
-          };
+          print('📍 Coordinates: $lat, $lng');
 
-          // Update existing or add new
-          if (!_employeeData.containsKey(employeeId)) {
-            _employeeData[employeeId] = data;
+          if (lat != null && lng != null) {
+            final employeeId = employeeInfo['_id'] as String;
+
+            // Store employee data
+            _employeeData[employeeId] = {
+              'employeeId': employeeId,
+              'employeeName': name,
+              'employeeDepartment': employeeInfo['department'],
+              'employeePhone': employeeInfo['phone'],
+              'latitude': lat,
+              'longitude': lng,
+              'address': emp['address'],
+              'lastUpdate': emp['lastUpdate'],
+              'checkInTime': emp['attendance']?['checkInTime'],
+            };
+
+            // Create pulse animation
             _createPulseAnimation(employeeId);
-            print('✅ Added new employee: ${employee['name']}');
+
+            // Create marker
+            final marker = _createEmployeeMarker(_employeeData[employeeId]!);
+            markers.add(marker);
+
+            print('✅ Added marker for $name');
           } else {
-            _employeeData[employeeId] = data;
-            print('🔄 Updated employee: ${employee['name']}');
+            print('⚠️ No location for $name');
           }
         } catch (e) {
           print('❌ Error processing employee: $e');
+          continue;
         }
       }
-
-      // Remove employees who checked out or reached office
-      for (var employeeId in oldEmployeeIds) {
-        if (!newEmployeeIds.contains(employeeId)) {
-          print('🗑️ Removing employee: $employeeId');
-          _employeeData.remove(employeeId);
-          _pulseAnimations[employeeId]?.dispose();
-          _pulseAnimations.remove(employeeId);
-        }
-      }
-
-      // Rebuild markers
-      _employeeMarkers.clear();
-      for (var data in _employeeData.values) {
-        _employeeMarkers.add(_createEmployeeMarker(data));
-      }
-
-      setState(() {
-        _checkedInCount = _employeeMarkers.length;
-        _isLoading = false; // ✅ Always set to false
-        _isRefreshing = false;
-      });
-
-      print('✅ Map loaded with ${_employeeMarkers.length} employee markers');
-    } catch (e) {
-      print('❌ Error loading employees: $e');
-
-      setState(() {
-        _isLoading = false; // ✅ Set to false even on error
-        _isRefreshing = false;
-      });
 
       if (mounted) {
+        setState(() {
+          _employeeMarkers = markers;
+          _checkedInCount = markers.length;
+          _isLoading = false;
+          _isRefreshing = false;
+        });
+        print('✅ Map loaded with ${markers.length} employee markers');
+      }
+    } catch (e) {
+      print('❌ Error loading employees: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isRefreshing = false;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error loading employees: $e'),
+            content: Text('Error loading data: $e'),
             backgroundColor: Colors.red,
             duration: const Duration(seconds: 3),
           ),
@@ -235,7 +236,6 @@ class _AdminMapScreenState extends State<AdminMapScreen>
     final employeeId = data['employeeId'];
     _employeeMarkers.removeWhere((m) => m.key.toString().contains(employeeId));
     _employeeMarkers.add(_createEmployeeMarker(data));
-    _checkedInCount = _employeeMarkers.length;
   }
 
   // Create employee marker
@@ -269,8 +269,9 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                         width: 50 * scale,
                         height: 50 * scale,
                         decoration: BoxDecoration(
-                          color: Colors.blue
-                              .withOpacity(0.3 - (pulseController.value * 0.2)),
+                          color: Colors.blue.withOpacity(
+                            0.3 - (pulseController.value * 0.2),
+                          ),
                           shape: BoxShape.circle,
                         ),
                       ),
@@ -305,6 +306,12 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                   color: Colors.blue,
                   shape: BoxShape.circle,
                   border: Border.all(color: Colors.white, width: 3),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.3),
+                      blurRadius: 8,
+                    ),
+                  ],
                 ),
                 child: const Icon(Icons.person, color: Colors.white, size: 20),
               ),
@@ -341,8 +348,8 @@ class _AdminMapScreenState extends State<AdminMapScreen>
     final checkInTime = data['checkInTime'] != null
         ? DateTime.parse(data['checkInTime'])
         : null;
-    final timestamp =
-        data['timestamp'] != null ? DateTime.parse(data['timestamp']) : null;
+    final lastUpdate =
+        data['lastUpdate'] != null ? DateTime.parse(data['lastUpdate']) : null;
 
     showModalBottomSheet(
       context: context,
@@ -379,7 +386,9 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                       const SizedBox(height: 4),
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 4),
+                          horizontal: 12,
+                          vertical: 4,
+                        ),
                         decoration: BoxDecoration(
                           color: Colors.blue[100],
                           borderRadius: BorderRadius.circular(12),
@@ -405,10 +414,10 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                 DateFormat('hh:mm a').format(checkInTime.toLocal()),
                 Icons.access_time,
               ),
-            if (timestamp != null)
+            if (lastUpdate != null)
               _buildDetailRow(
                 'Last Update',
-                _getTimeAgo(timestamp),
+                _getTimeAgo(lastUpdate),
                 Icons.update,
               ),
             if (data['employeeDepartment'] != null)
@@ -416,6 +425,12 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                 'Department',
                 data['employeeDepartment'],
                 Icons.business,
+              ),
+            if (data['employeePhone'] != null)
+              _buildDetailRow(
+                'Phone',
+                data['employeePhone'],
+                Icons.phone,
               ),
             _buildDetailRow(
               'Location',
@@ -468,7 +483,9 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                 Text(
                   value,
                   style: const TextStyle(
-                      fontWeight: FontWeight.w600, fontSize: 14),
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                  ),
                 ),
               ],
             ),
@@ -486,6 +503,8 @@ class _AdminMapScreenState extends State<AdminMapScreen>
       return '${difference.inSeconds}s ago';
     } else if (difference.inMinutes < 60) {
       return '${difference.inMinutes}m ago';
+    } else if (difference.inHours < 24) {
+      return '${difference.inHours}h ago';
     } else {
       return DateFormat('hh:mm a').format(timestamp);
     }
@@ -546,7 +565,7 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                         Container(
                           padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
-                            color: Colors.blue,
+                            color: Colors.red,
                             shape: BoxShape.circle,
                             border: Border.all(color: Colors.white, width: 3),
                             boxShadow: [
@@ -565,9 +584,11 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                         const SizedBox(height: 6),
                         Container(
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 6),
+                            horizontal: 12,
+                            vertical: 6,
+                          ),
                           decoration: BoxDecoration(
-                            color: Colors.blue,
+                            color: Colors.red,
                             borderRadius: BorderRadius.circular(8),
                           ),
                           child: const Text(
@@ -657,7 +678,9 @@ class _AdminMapScreenState extends State<AdminMapScreen>
                     else
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 6),
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
                         decoration: BoxDecoration(
                           color: Colors.green[100],
                           borderRadius: BorderRadius.circular(20),

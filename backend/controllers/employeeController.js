@@ -1,6 +1,7 @@
 // controllers/employeeController.js
 const Location = require("../models/Location");
 const Attendance = require("../models/Attendance");
+const User = require("../models/User");
 
 // Helper: Calculate distance between two points (Haversine formula)
 const calculateDistance = (lat1, lon1, lat2, lon2) => {
@@ -32,6 +33,12 @@ const calculateETA = (distanceInMeters) => {
 exports.checkIn = async (req, res) => {
   try {
     const { latitude, longitude, address, accuracy } = req.body;
+
+    console.log(`📍 Check-in request from ${req.user.name}:`, {
+      latitude,
+      longitude,
+      address,
+    });
 
     if (!latitude || !longitude) {
       return res.status(400).json({
@@ -71,10 +78,12 @@ exports.checkIn = async (req, res) => {
     const officeRadius = parseFloat(process.env.OFFICE_RADIUS);
     const isInOffice = distanceFromOffice <= officeRadius;
 
-    // If checking in from office, set status as REACHED_OFFICE
     const attendanceStatus = isInOffice ? "REACHED_OFFICE" : "CHECKED_IN";
 
-    // Create attendance record
+    console.log(`📏 Distance from office: ${Math.round(distanceFromOffice)}m`);
+    console.log(`✅ Status: ${attendanceStatus}`);
+
+    // ✅ Create attendance record WITHOUT checkOutLocation
     const attendance = await Attendance.create({
       employeeId,
       date: today,
@@ -82,11 +91,25 @@ exports.checkIn = async (req, res) => {
       checkInLocation: {
         type: "Point",
         coordinates: [longitude, latitude],
+        address: address || "Unknown",
+        timestamp: new Date(),
+      },
+      currentLocation: {
+        type: "Point",
+        coordinates: [longitude, latitude],
+        address: address || "Unknown",
+        timestamp: new Date(),
       },
       checkInAddress: address || "Unknown",
       estimatedTimeToOffice: eta,
       distanceFromOffice: Math.round(distanceFromOffice),
       status: attendanceStatus,
+      // ❌ DON'T CREATE checkOutLocation HERE!
+    });
+
+    // Update user status
+    await User.findByIdAndUpdate(employeeId, {
+      isCheckedIn: !isInOffice,
     });
 
     // Create location record
@@ -102,6 +125,8 @@ exports.checkIn = async (req, res) => {
       isInOffice,
       timestamp: new Date(),
     });
+
+    console.log(`✅ ${req.user.name} checked in successfully`);
 
     // 🚀 BROADCAST CHECK-IN TO ADMIN
     if (req.app.get("io")) {
@@ -139,6 +164,7 @@ exports.checkIn = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("❌ Check-in error:", error);
     res.status(500).json({
       success: false,
       message: "Error checking in",
@@ -153,6 +179,8 @@ exports.checkIn = async (req, res) => {
 exports.checkOut = async (req, res) => {
   try {
     const { latitude, longitude, address } = req.body;
+
+    console.log(`📍 Check-out request from ${req.user.name}`);
 
     if (!latitude || !longitude) {
       return res.status(400).json({
@@ -191,11 +219,18 @@ exports.checkOut = async (req, res) => {
     attendance.checkOutLocation = {
       type: "Point",
       coordinates: [longitude, latitude],
+      address: address || "Unknown",
+      timestamp: new Date(),
     };
     attendance.checkOutAddress = address || "Unknown";
     attendance.totalHours = parseFloat(totalHours);
     attendance.status = "CHECKED_OUT";
     await attendance.save();
+
+    // Update user status
+    await User.findByIdAndUpdate(employeeId, {
+      isCheckedIn: false,
+    });
 
     // Update location to OFFLINE
     await Location.create({
@@ -209,6 +244,8 @@ exports.checkOut = async (req, res) => {
       isInOffice: false,
       timestamp: new Date(),
     });
+
+    console.log(`✅ ${req.user.name} checked out (${totalHours}h)`);
 
     // 🛑 BROADCAST CHECK-OUT TO ADMIN
     if (req.app.get("io")) {
@@ -233,6 +270,7 @@ exports.checkOut = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("❌ Check-out error:", error);
     res.status(500).json({
       success: false,
       message: "Error checking out",
@@ -241,7 +279,7 @@ exports.checkOut = async (req, res) => {
   }
 };
 
-// @desc    Update location (🚀 REAL-TIME TRACKING - AUTO REACH DETECTION)
+// @desc    Update location (🚀 REAL-TIME TRACKING)
 // @route   POST /api/employee/location
 // @access  Private (Employee)
 exports.updateLocation = async (req, res) => {
@@ -266,6 +304,10 @@ exports.updateLocation = async (req, res) => {
     const employeeId = req.user.id;
     const today = new Date().toISOString().split("T")[0];
 
+    console.log(
+      `📍 Location update from ${req.user.name}: ${latitude}, ${longitude}`
+    );
+
     // Calculate distance from office
     const officeLat = parseFloat(process.env.OFFICE_LAT);
     const officeLng = parseFloat(process.env.OFFICE_LNG);
@@ -278,26 +320,53 @@ exports.updateLocation = async (req, res) => {
     );
     const isInOffice = distanceFromOffice <= officeRadius;
 
-    // 🎯 AUTO-DETECT OFFICE ARRIVAL
+    console.log(`📏 Distance from office: ${Math.round(distanceFromOffice)}m`);
+
+    // Find today's attendance
     const attendance = await Attendance.findOne({
       employeeId,
       date: today,
-      status: "CHECKED_IN",
+      status: { $in: ["CHECKED_IN", "REACHED_OFFICE"] },
     });
+
+    if (!attendance) {
+      return res.status(400).json({
+        success: false,
+        message: "No active attendance found. Please check in first.",
+      });
+    }
 
     let hasReachedOffice = false;
 
-    if (attendance && isInOffice) {
-      // Employee has reached office!
+    // ✅ UPDATE CURRENT LOCATION IN ATTENDANCE
+    attendance.currentLocation = {
+      type: "Point",
+      coordinates: [longitude, latitude],
+      address: address || "Unknown",
+      timestamp: new Date(),
+    };
+
+    // 🎯 AUTO-DETECT OFFICE ARRIVAL
+    if (isInOffice && attendance.status === "CHECKED_IN") {
       attendance.status = "REACHED_OFFICE";
-      await attendance.save();
+      attendance.reachedOfficeTime = new Date();
       hasReachedOffice = true;
+
+      // Update user status
+      await User.findByIdAndUpdate(employeeId, {
+        isCheckedIn: false,
+      });
 
       console.log(`🎉 ${req.user.name} has REACHED the office!`);
     }
 
-    // Create location record
-    const location = await Location.create({
+    // Save updated attendance
+    await attendance.save();
+
+    console.log(`✅ Location updated for ${req.user.name}`);
+
+    // Create location history record
+    await Location.create({
       employeeId,
       location: {
         type: "Point",
@@ -333,25 +402,27 @@ exports.updateLocation = async (req, res) => {
       };
 
       req.app.get("io").to("admin").emit("employee_status_changed", updateData);
+      req.app.get("io").to("admin").emit("location_update", updateData);
     }
 
-    res.status(201).json({
+    res.status(200).json({
       success: true,
       message: hasReachedOffice
         ? "🎉 You have reached the office!"
         : "Location updated",
       data: {
-        location,
+        currentLocation: attendance.currentLocation,
         isInOffice,
         hasReachedOffice,
         distanceFromOffice: Math.round(distanceFromOffice),
       },
     });
   } catch (error) {
-    console.error("Location update error:", error.message);
-    res.status(200).json({
+    console.error("❌ Location update error:", error.message);
+    res.status(500).json({
       success: false,
-      message: "Location update failed silently",
+      message: "Location update failed",
+      error: error.message,
     });
   }
 };
@@ -385,6 +456,7 @@ exports.getMyAttendance = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("❌ Error fetching attendance:", error);
     res.status(500).json({
       success: false,
       message: "Error fetching attendance",
@@ -409,7 +481,7 @@ exports.getMyStatus = async (req, res) => {
     const latestLocation = await Location.findOne({
       employeeId,
       timestamp: {
-        $gte: new Date(Date.now() - 5 * 60 * 1000),
+        $gte: new Date(Date.now() - 5 * 60 * 1000), // Last 5 minutes
       },
     })
       .sort({ timestamp: -1 })
@@ -431,6 +503,7 @@ exports.getMyStatus = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("❌ Error fetching status:", error);
     res.status(500).json({
       success: false,
       message: "Error fetching status",

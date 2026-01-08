@@ -10,6 +10,7 @@ import '../../services/location_service.dart';
 import '../../services/socket_service.dart';
 import '../../models/attendance.dart';
 import '../auth/login_screen.dart';
+import '../../services/offline_queue_service.dart';
 
 class EmployeeHomeScreen extends StatefulWidget {
   const EmployeeHomeScreen({Key? key}) : super(key: key);
@@ -47,6 +48,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     _loadStatus();
     _getCurrentLocation();
     _initializeSocket();
+    _initializeServices();
   }
 
   @override
@@ -112,6 +114,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
   }
 
   // 🚀 START REAL-TIME TRACKING (POSITION STREAM)
+  // 🚀 START REAL-TIME TRACKING (POSITION STREAM)
   void _startLocationTracking() {
     if (_isTracking) {
       print('⚠️ Already tracking');
@@ -127,6 +130,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     print('🟢 REAL-TIME LOCATION TRACKING STARTED');
     print('🟢 Mode: Position Stream (auto-updates)');
     print('🟢 Updates when you move 10+ meters');
+    print('🟢 Backup check every 15 seconds');
     print('🟢 ========================================');
 
     // ✅ SEND FIRST UPDATE IMMEDIATELY
@@ -165,10 +169,45 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       cancelOnError: false, // Keep stream alive
     );
 
-    // ✅ BACKUP TIMER (every 30s) - ensures updates even when standing still
-    _backupTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
-      print('\n⏰ Backup timer update (#${timer.tick})');
-      await _sendLocationUpdate();
+    // ✅ BACKUP TIMER (every 15s) - ensures updates even when stream is idle
+    _backupTimer = Timer.periodic(const Duration(seconds: 15), (timer) async {
+      print('\n⏰ Backup check (#${timer.tick})');
+
+      try {
+        final newPosition = await _locationService.getCurrentPosition();
+
+        if (_currentPosition != null) {
+          final moved = _locationService.calculateDistance(
+            _currentPosition!.latitude,
+            _currentPosition!.longitude,
+            newPosition.latitude,
+            newPosition.longitude,
+          );
+
+          print('📏 Distance since last update: ${moved.toStringAsFixed(1)}m');
+
+          if (moved > 5) {
+            // Stream should have caught this, but send anyway
+            print(
+                '⚠️ Sending backup update (moved ${moved.toStringAsFixed(1)}m)');
+            await _handlePositionUpdate(newPosition, user);
+          } else {
+            print(
+                '✅ Position stable (moved only ${moved.toStringAsFixed(1)}m)');
+
+            // Still send a heartbeat update every minute
+            if (timer.tick % 4 == 0) {
+              print('💓 Sending heartbeat update');
+              await _handlePositionUpdate(newPosition, user);
+            }
+          }
+        } else {
+          // First update
+          await _handlePositionUpdate(newPosition, user);
+        }
+      } catch (e) {
+        print('❌ Backup check failed: $e');
+      }
     });
   }
 
