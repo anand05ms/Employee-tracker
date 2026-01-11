@@ -181,6 +181,56 @@ router.get("/not-checked-in-employees", async (req, res) => {
     });
   }
 });
+// GET /api/admin/checked-out-employees (ADD THIS)
+router.get("/checked-out-employees", async (req, res) => {
+  try {
+    console.log("📋 Getting checked-out employees...");
+
+    const today = new Date().toISOString().split("T")[0];
+
+    const attendances = await Attendance.find({
+      date: today,
+      status: "CHECKED_OUT",
+    }).populate("employeeId", "-password");
+
+    const employees = attendances
+      .filter((att) => att.employeeId) // Filter out null
+      .map((att) => ({
+        employee: {
+          _id: att.employeeId._id,
+          name: att.employeeId.name,
+          email: att.employeeId.email,
+          employeeId: att.employeeId.employeeId,
+          phone: att.employeeId.phone,
+          department: att.employeeId.department,
+        },
+        attendance: {
+          checkInTime: att.checkInTime,
+          checkOutTime: att.checkOutTime,
+          totalHours: att.totalHours || 0,
+          checkInAddress: att.checkInAddress || "N/A",
+          checkOutAddress: att.checkOutAddress || "N/A",
+        },
+      }));
+
+    console.log(`✅ Found ${employees.length} checked-out employees`);
+
+    res.json({
+      success: true,
+      count: employees.length,
+      data: {
+        employees,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error getting checked-out employees:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+});
 
 // GET /api/admin/dashboard-stats
 router.get("/dashboard-stats", async (req, res) => {
@@ -209,9 +259,9 @@ router.get("/dashboard-stats", async (req, res) => {
 
     const stats = {
       totalEmployees,
-      checkedInEmployees: checkedInCount,
-      reachedEmployees: reachedCount,
-      checkedOutEmployees: checkedOutCount,
+      checkedInToday: checkedInCount, // 🔥 rename
+      inOfficeCount: reachedCount, // 🔥 rename
+      checkedOutToday: checkedOutCount, // 🔥 rename (optional now)
       notCheckedIn: notCheckedInCount,
     };
 

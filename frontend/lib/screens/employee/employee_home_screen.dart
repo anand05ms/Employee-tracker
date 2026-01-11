@@ -2,15 +2,17 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:intl/intl.dart';
 import 'dart:async';
 import '../../services/auth_provider.dart';
 import '../../services/api_service.dart';
 import '../../services/location_service.dart';
 import '../../services/socket_service.dart';
+import '../../services/offline_queue_service.dart';
 import '../../models/attendance.dart';
 import '../auth/login_screen.dart';
-import '../../services/offline_queue_service.dart';
 
 class EmployeeHomeScreen extends StatefulWidget {
   const EmployeeHomeScreen({Key? key}) : super(key: key);
@@ -19,10 +21,12 @@ class EmployeeHomeScreen extends StatefulWidget {
   State<EmployeeHomeScreen> createState() => _EmployeeHomeScreenState();
 }
 
-class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
+class _EmployeeHomeScreenState extends State<EmployeeHomeScreen>
+    with WidgetsBindingObserver {
   final ApiService _apiService = ApiService();
   final LocationService _locationService = LocationService();
   final SocketService _socketService = SocketService();
+  final OfflineQueueService _offlineQueue = OfflineQueueService();
 
   bool _isLoading = false;
   bool _isCheckedIn = false;
@@ -32,30 +36,259 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
   int? _estimatedTimeToOffice;
   int? _distanceFromOffice;
 
-  // ✅ Real-time tracking with STREAM
+  // Real-time tracking
   StreamSubscription<Position>? _positionStreamSubscription;
+  StreamSubscription<ConnectivityResult>? _connectivitySubscription;
   Timer? _backupTimer;
   bool _isTracking = false;
 
   // Office location
   static const double officeLat = 9.88162;
   static const double officeLng = 78.11582;
-  static const double officeRadius = 500; // meters
+  static const double officeRadius = 500;
 
   @override
   void initState() {
     super.initState();
-    _loadStatus();
-    _getCurrentLocation();
-    _initializeSocket();
+    WidgetsBinding.instance.addObserver(this);
     _initializeServices();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stopLocationTracking();
     _socketService.disconnect();
+    _connectivitySubscription?.cancel();
     super.dispose();
+  }
+
+  // ✅ Handle app lifecycle (background/foreground)
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      print('📱 App resumed - checking socket connection');
+      if (_isCheckedIn && !_hasReachedOffice && !_socketService.isConnected) {
+        _socketService.forceReconnect();
+      }
+    } else if (state == AppLifecycleState.paused) {
+      print('📱 App paused - tracking continues in background');
+    }
+  }
+
+  // ✅ Initialize all services
+  Future<void> _initializeServices() async {
+    // 1. Check location permission
+    final hasPermission = await _checkLocationPermission();
+    if (!hasPermission) return;
+
+    // 2. Initialize offline queue
+    await _offlineQueue.initialize();
+
+    // 3. Monitor connectivity
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen((result) {
+      if (result != ConnectivityResult.none && _offlineQueue.hasQueuedUpdates) {
+        print(
+            '🌐 Connectivity restored - processing ${_offlineQueue.queueSize} queued updates');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+                '📡 Syncing ${_offlineQueue.queueSize} pending updates...'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.blue,
+          ),
+        );
+      }
+    });
+
+    // 4. Load status and location
+    await _loadStatus();
+    await _getCurrentLocation();
+
+    // 5. Initialize socket
+    await _initializeSocket();
+  }
+
+  Future<bool> _ensureLocationServiceEnabled() async {
+    final enabled = await Geolocator.isLocationServiceEnabled();
+
+    if (!enabled && mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: Row(
+            children: const [
+              Icon(Icons.gps_off, color: Colors.red),
+              SizedBox(width: 8),
+              Text('Turn on Location'),
+            ],
+          ),
+          content: const Text(
+            'Location services are turned off.\n\nPlease enable GPS to continue.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Geolocator.openLocationSettings();
+              },
+              child: const Text('Open Settings'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      );
+      return false;
+    }
+    return true;
+  }
+
+  // ✅ Check and request location permission
+  Future<bool> _checkLocationPermission() async {
+    final status = await Permission.locationWhenInUse.status;
+
+    if (status.isGranted) {
+      // Check if location service is enabled
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        _showLocationServiceDialog();
+        return false;
+      }
+      return true;
+    }
+
+    if (status.isDenied) {
+      final result = await Permission.locationWhenInUse.request();
+      if (result.isGranted) {
+        return true;
+      }
+    }
+
+    if (status.isPermanentlyDenied) {
+      _showPermissionDeniedDialog();
+      return false;
+    }
+
+    _showPermissionRequiredDialog();
+    return false;
+  }
+
+  String _friendlyApiError(dynamic e) {
+    final msg = e.toString();
+
+    if (msg.contains('already checked in')) {
+      return 'You are already checked in today';
+    }
+    if (msg.contains('not checked in')) {
+      return 'You are not checked in yet';
+    }
+    if (msg.contains('Location')) {
+      return 'Unable to fetch location. Please enable GPS';
+    }
+    if (msg.contains('Network')) {
+      return 'Network error. Please check your internet';
+    }
+    if (msg.contains('timeout')) {
+      return 'Server taking too long. Try again';
+    }
+    return 'Something went wrong. Please try again';
+  }
+
+  // ✅ Show location service disabled dialog
+  void _showLocationServiceDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.location_off, color: Colors.red),
+            SizedBox(width: 12),
+            Text('Location Service Disabled'),
+          ],
+        ),
+        content: const Text(
+          'Please enable location services to use this app.\n\nGo to Settings → Location → Turn On',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Geolocator.openLocationSettings();
+            },
+            child: const Text('Open Settings'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ✅ Show permission required dialog
+  void _showPermissionRequiredDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.location_on, color: Colors.orange),
+            SizedBox(width: 12),
+            Text('Location Permission Required'),
+          ],
+        ),
+        content: const Text(
+          'This app needs location permission to track your attendance and distance to office.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await _checkLocationPermission();
+            },
+            child: const Text('Grant Permission'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ✅ Show permission permanently denied dialog
+  void _showPermissionDeniedDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.block, color: Colors.red),
+            SizedBox(width: 12),
+            Text('Permission Denied'),
+          ],
+        ),
+        content: const Text(
+          'Location permission is permanently denied. Please enable it in app settings.\n\nSettings → Apps → EmpTracker → Permissions → Location',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              openAppSettings();
+            },
+            child: const Text('Open Settings'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _initializeSocket() async {
@@ -89,6 +322,8 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
 
   Future<void> _getCurrentLocation() async {
     try {
+      if (!await _ensureLocationServiceEnabled()) return;
+
       final position = await _locationService.getCurrentPosition();
       setState(() {
         _currentPosition = position;
@@ -113,8 +348,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     }
   }
 
-  // 🚀 START REAL-TIME TRACKING (POSITION STREAM)
-  // 🚀 START REAL-TIME TRACKING (POSITION STREAM)
+  // 🚀 START REAL-TIME TRACKING
   void _startLocationTracking() {
     if (_isTracking) {
       print('⚠️ Already tracking');
@@ -128,18 +362,17 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
 
     print('🟢 ========================================');
     print('🟢 REAL-TIME LOCATION TRACKING STARTED');
-    print('🟢 Mode: Position Stream (auto-updates)');
-    print('🟢 Updates when you move 10+ meters');
-    print('🟢 Backup check every 15 seconds');
+    print('🟢 Mode: Position Stream + Backup Timer');
+    print('🟢 Updates: Every 10m movement + 15s backup');
     print('🟢 ========================================');
 
-    // ✅ SEND FIRST UPDATE IMMEDIATELY
+    // Send first update
     _sendLocationUpdate();
 
-    // ✅ START POSITION STREAM (updates automatically when moving)
+    // Position stream
     final locationSettings = LocationSettings(
       accuracy: LocationAccuracy.high,
-      distanceFilter: 10, // Update every 10 meters
+      distanceFilter: 10,
     );
 
     _positionStreamSubscription = Geolocator.getPositionStream(
@@ -148,9 +381,8 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       (Position position) async {
         print('\n📡 ===== STREAM UPDATE =====');
         print(
-            '📍 Position: ${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}');
+            '📍 ${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}');
 
-        // Show movement from last position
         if (_currentPosition != null) {
           final moved = _locationService.calculateDistance(
             _currentPosition!.latitude,
@@ -158,18 +390,16 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
             position.latitude,
             position.longitude,
           );
-          print('🚶 Moved ${moved.toStringAsFixed(1)}m since last update');
+          print('🚶 Moved ${moved.toStringAsFixed(1)}m');
         }
 
         await _handlePositionUpdate(position, user);
       },
-      onError: (error) {
-        print('❌ Position stream error: $error');
-      },
-      cancelOnError: false, // Keep stream alive
+      onError: (error) => print('❌ Position stream error: $error'),
+      cancelOnError: false,
     );
 
-    // ✅ BACKUP TIMER (every 15s) - ensures updates even when stream is idle
+    // Backup timer
     _backupTimer = Timer.periodic(const Duration(seconds: 15), (timer) async {
       print('\n⏰ Backup check (#${timer.tick})');
 
@@ -184,29 +414,20 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
             newPosition.longitude,
           );
 
-          print('📏 Distance since last update: ${moved.toStringAsFixed(1)}m');
+          print('📏 Distance since last: ${moved.toStringAsFixed(1)}m');
 
           if (moved > 5) {
-            // Stream should have caught this, but send anyway
-            print(
-                '⚠️ Sending backup update (moved ${moved.toStringAsFixed(1)}m)');
+            print('⚠️ Backup update (moved ${moved.toStringAsFixed(1)}m)');
             await _handlePositionUpdate(newPosition, user);
-          } else {
-            print(
-                '✅ Position stable (moved only ${moved.toStringAsFixed(1)}m)');
-
-            // Still send a heartbeat update every minute
-            if (timer.tick % 4 == 0) {
-              print('💓 Sending heartbeat update');
-              await _handlePositionUpdate(newPosition, user);
-            }
+          } else if (timer.tick % 4 == 0) {
+            print('💓 Heartbeat update');
+            await _handlePositionUpdate(newPosition, user);
           }
         } else {
-          // First update
           await _handlePositionUpdate(newPosition, user);
         }
       } catch (e) {
-        print('❌ Backup check failed: $e');
+        print('❌ Backup failed: $e');
       }
     });
   }
@@ -214,7 +435,6 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
   // 📍 HANDLE POSITION UPDATE
   Future<void> _handlePositionUpdate(Position position, user) async {
     try {
-      // Calculate distance from office
       final distance = _locationService.calculateDistance(
         position.latitude,
         position.longitude,
@@ -223,49 +443,73 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       );
 
       final isInOffice = distance <= officeRadius;
+      print('🏢 Distance: ${distance.toStringAsFixed(0)}m');
 
-      print('🏢 Distance from office: ${distance.toStringAsFixed(0)}m');
+      // ✅ TRY TO UPDATE BACKEND (with timeout)
+      try {
+        final response = await _apiService
+            .updateLocation(
+              position.latitude,
+              position.longitude,
+              'Moving - ${DateTime.now().toString().substring(11, 19)}',
+            )
+            .timeout(const Duration(seconds: 10));
 
-      // Update backend
-      final response = await _apiService.updateLocation(
-        position.latitude,
-        position.longitude,
-        'Moving - ${DateTime.now().toString().substring(11, 19)}',
-      );
+        print('✅ Backend updated');
 
-      print('✅ Backend updated');
+        // Check if reached office
+        if (response['data']?['hasReachedOffice'] == true &&
+            !_hasReachedOffice) {
+          print('🎉 REACHED OFFICE!');
 
-      // 🎉 CHECK IF REACHED OFFICE
-      if (response['data']?['hasReachedOffice'] == true && !_hasReachedOffice) {
-        print('🎉 🎉 🎉 REACHED OFFICE! 🎉 🎉 🎉');
+          setState(() {
+            _hasReachedOffice = true;
+            _isCheckedIn = false;
+          });
 
-        setState(() {
-          _hasReachedOffice = true;
-          _isCheckedIn = false;
-        });
+          _stopLocationTracking();
 
-        // Stop tracking
-        _stopLocationTracking();
-
-        // Show celebration dialog
-        if (mounted) {
-          _showReachedOfficeDialog();
+          if (mounted) {
+            _showReachedOfficeDialog();
+          }
+          return;
         }
-        return;
+
+        // Broadcast via Socket
+        if (_socketService.isConnected) {
+          _socketService.sendLocationUpdate({
+            'employeeId': user?.id ?? '',
+            'employeeName': user?.name ?? 'Unknown',
+            'latitude': position.latitude,
+            'longitude': position.longitude,
+            'isInOffice': isInOffice,
+            'hasReachedOffice': response['data']?['hasReachedOffice'] ?? false,
+            'timestamp': DateTime.now().toIso8601String(),
+          });
+          print('📡 Socket.io sent');
+        }
+      } catch (e) {
+        print('❌ Backend update failed: $e');
+
+        // ✅ ADD TO OFFLINE QUEUE
+        await _offlineQueue.addLocationUpdate(
+          position.latitude,
+          position.longitude,
+          'Offline - ${DateTime.now().toString().substring(11, 19)}',
+        );
+
+        // Show notification
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                  '📡 Offline - ${_offlineQueue.queueSize} updates queued'),
+              duration: const Duration(seconds: 2),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
       }
-
-      // Broadcast via Socket.io
-      _socketService.sendLocationUpdate({
-        'employeeId': user?.id ?? '',
-        'employeeName': user?.name ?? 'Unknown',
-        'latitude': position.latitude,
-        'longitude': position.longitude,
-        'isInOffice': isInOffice,
-        'hasReachedOffice': response['data']?['hasReachedOffice'] ?? false,
-        'timestamp': DateTime.now().toIso8601String(),
-      });
-
-      print('📡 Socket.io broadcast sent');
 
       // Update UI
       if (mounted) {
@@ -282,13 +526,12 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     }
   }
 
-  // 📍 SEND LOCATION UPDATE (for manual/timer calls)
   Future<void> _sendLocationUpdate() async {
     try {
       final authProvider = Provider.of<AuthProvider>(context, listen: false);
       final user = authProvider.currentUser;
 
-      print('📡 Getting fresh GPS location...');
+      print('📡 Getting GPS location...');
       final position = await _locationService.getCurrentPosition();
 
       await _handlePositionUpdate(position, user);
@@ -297,13 +540,10 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     }
   }
 
-  // 🛑 STOP TRACKING
   void _stopLocationTracking() {
-    // Cancel position stream
     _positionStreamSubscription?.cancel();
     _positionStreamSubscription = null;
 
-    // Cancel backup timer
     _backupTimer?.cancel();
     _backupTimer = null;
 
@@ -311,12 +551,9 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       setState(() => _isTracking = false);
     }
 
-    print('🔴 ========================================');
     print('🔴 LOCATION TRACKING STOPPED');
-    print('🔴 ========================================');
   }
 
-  // 🎉 SHOW REACHED OFFICE DIALOG
   void _showReachedOfficeDialog() {
     showDialog(
       context: context,
@@ -327,10 +564,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
             Icon(Icons.celebration, color: Colors.green[700], size: 32),
             const SizedBox(width: 12),
             const Expanded(
-              child: Text(
-                'Welcome to Office!',
-                style: TextStyle(fontSize: 20),
-              ),
+              child: Text('Welcome to Office!', style: TextStyle(fontSize: 20)),
             ),
           ],
         ),
@@ -345,17 +579,14 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
               textAlign: TextAlign.center,
             ),
             SizedBox(height: 8),
-            Text(
-              'You are now marked as present.',
-              textAlign: TextAlign.center,
-            ),
+            Text('You are now marked as present.', textAlign: TextAlign.center),
           ],
         ),
         actions: [
           TextButton(
             onPressed: () {
               Navigator.pop(context);
-              _loadStatus(); // Refresh status
+              _loadStatus();
             },
             child: const Text('OK'),
           ),
@@ -365,13 +596,13 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
   }
 
   Future<void> _handleCheckIn() async {
-    // Get FRESH location before check-in
     await _getCurrentLocation();
+    if (!await _ensureLocationServiceEnabled()) return;
 
     if (_currentPosition == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Unable to get your location. Please try again.'),
+          content: Text('Unable to get location. Please try again.'),
           backgroundColor: Colors.orange,
         ),
       );
@@ -382,7 +613,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
 
     try {
       print(
-          '📍 Check-in location: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}');
+          '📍 Check-in: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}');
 
       final response = await _apiService.checkIn(
         _currentPosition!.latitude,
@@ -399,11 +630,9 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       });
 
       if (hasReached) {
-        // Already at office
         _showReachedOfficeDialog();
       } else {
-        // ✅ START TRACKING IMMEDIATELY
-        print('🚀 Starting location tracking...');
+        print('🚀 Starting tracking...');
         _startLocationTracking();
       }
 
@@ -419,10 +648,11 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       await _loadStatus();
     } catch (e) {
       setState(() => _isLoading = false);
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Check-in failed: $e'),
+            content: Text(_friendlyApiError(e)),
             backgroundColor: Colors.red,
           ),
         );
@@ -431,15 +661,19 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
   }
 
   Future<void> _handleCheckOut() async {
+    if (!await _ensureLocationServiceEnabled()) return;
+
     if (_currentPosition == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Getting your location...'),
-          backgroundColor: Colors.orange,
-        ),
-      );
       await _getCurrentLocation();
-      return;
+      if (_currentPosition == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Unable to get location'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
     }
 
     setState(() => _isLoading = true);
@@ -474,7 +708,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Check-out failed: $e'),
+            content: Text(_friendlyApiError(e)),
             backgroundColor: Colors.red,
           ),
         );
@@ -494,6 +728,24 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
     }
   }
 
+  Widget _buildInfoItem(String label, String value, IconData icon) {
+    return Column(
+      children: [
+        Icon(icon, size: 32, color: Colors.blue[700]),
+        const SizedBox(height: 8),
+        Text(
+          value,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(color: Colors.grey[600], fontSize: 14),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final authProvider = Provider.of<AuthProvider>(context);
@@ -503,6 +755,53 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
       appBar: AppBar(
         title: const Text('Employee Dashboard'),
         actions: [
+          // Network status
+          StreamBuilder<ConnectivityResult>(
+            stream: Connectivity().onConnectivityChanged,
+            builder: (context, snapshot) {
+              final isOnline = snapshot.data != ConnectivityResult.none;
+              final queueSize = _offlineQueue.queueSize;
+
+              if (!isOnline || queueSize > 0) {
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isOnline ? Colors.orange[100] : Colors.red[100],
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isOnline ? Icons.cloud_queue : Icons.cloud_off,
+                            size: 14,
+                            color: isOnline ? Colors.orange : Colors.red,
+                          ),
+                          if (queueSize > 0) ...[
+                            const SizedBox(width: 4),
+                            Text(
+                              '$queueSize',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: isOnline ? Colors.orange : Colors.red,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              }
+              return const SizedBox.shrink();
+            },
+          ),
+
           // Tracking indicator
           if (_isTracking)
             Padding(
@@ -573,19 +872,14 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
                       const SizedBox(height: 8),
                       Text(
                         user?.department ?? 'Employee',
-                        style: TextStyle(
-                          color: Colors.grey[600],
-                          fontSize: 16,
-                        ),
+                        style: TextStyle(color: Colors.grey[600], fontSize: 16),
                       ),
                       if (user?.employeeId != null) ...[
                         const SizedBox(height: 4),
                         Text(
                           'ID: ${user?.employeeId}',
-                          style: TextStyle(
-                            color: Colors.grey[600],
-                            fontSize: 14,
-                          ),
+                          style:
+                              TextStyle(color: Colors.grey[600], fontSize: 14),
                         ),
                       ],
                     ],
@@ -627,9 +921,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
                                       ? '🚶 On the way'
                                       : 'Not Checked In'),
                               style: const TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                              ),
+                                  fontSize: 18, fontWeight: FontWeight.bold),
                             ),
                             if (_todayAttendance != null) ...[
                               const SizedBox(height: 4),
@@ -646,7 +938,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
                                       size: 16, color: Colors.blue[700]),
                                   const SizedBox(width: 4),
                                   Text(
-                                    'Auto-tracking (Stream)',
+                                    'Auto-tracking',
                                     style: TextStyle(
                                       color: Colors.blue[700],
                                       fontSize: 12,
@@ -666,7 +958,7 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
 
               const SizedBox(height: 16),
 
-              // Distance info (only if not reached)
+              // Distance info
               if (_isCheckedIn &&
                   !_hasReachedOffice &&
                   _currentPosition != null) ...[
@@ -765,11 +1057,8 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
                   ),
                   child: Column(
                     children: [
-                      const Icon(
-                        Icons.check_circle,
-                        color: Colors.green,
-                        size: 64,
-                      ),
+                      const Icon(Icons.check_circle,
+                          color: Colors.green, size: 64),
                       const SizedBox(height: 16),
                       const Text(
                         '🎉 You are in the office!',
@@ -820,22 +1109,18 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
                             const Text(
                               'Current Location',
                               style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
+                                  fontSize: 16, fontWeight: FontWeight.bold),
                             ),
                             if (_isTracking)
                               Container(
                                 padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
-                                ),
+                                    horizontal: 8, vertical: 4),
                                 decoration: BoxDecoration(
                                   color: Colors.green[100],
                                   borderRadius: BorderRadius.circular(12),
                                 ),
                                 child: const Text(
-                                  'Live Stream',
+                                  'Live',
                                   style: TextStyle(
                                     color: Colors.green,
                                     fontSize: 10,
@@ -867,30 +1152,6 @@ class _EmployeeHomeScreenState extends State<EmployeeHomeScreen> {
           ),
         ),
       ),
-    );
-  }
-
-  Widget _buildInfoItem(String label, String value, IconData icon) {
-    return Column(
-      children: [
-        Icon(icon, size: 32, color: Colors.blue[700]),
-        const SizedBox(height: 8),
-        Text(
-          value,
-          style: const TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          label,
-          style: TextStyle(
-            color: Colors.grey[600],
-            fontSize: 14,
-          ),
-        ),
-      ],
     );
   }
 }

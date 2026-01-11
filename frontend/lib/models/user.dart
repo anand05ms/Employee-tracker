@@ -3,49 +3,46 @@ class User {
   final String id;
   final String name;
   final String email;
-  final String role;
-  final String? employeeId;
   final String? phone;
   final String? department;
+  final String? employeeId;
+  final String role;
   final bool isActive;
 
   User({
     required this.id,
     required this.name,
     required this.email,
-    required this.role,
-    this.employeeId,
     this.phone,
     this.department,
+    this.employeeId,
+    required this.role,
     this.isActive = true,
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
     return User(
-      id: json['_id'] ?? '',
+      id: json['_id'] ?? json['id'] ?? '',
       name: json['name'] ?? '',
       email: json['email'] ?? '',
-      role: json['role'] ?? 'EMPLOYEE',
-      employeeId: json['employeeId'],
       phone: json['phone'],
       department: json['department'],
+      employeeId: json['employeeId'],
+      role: json['role'] ?? 'EMPLOYEE',
       isActive: json['isActive'] ?? true,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
-      '_id': id,
+      'id': id,
       'name': name,
       'email': email,
-      'role': role,
-      'employeeId': employeeId,
       'phone': phone,
       'department': department,
+      'employeeId': employeeId,
+      'role': role,
       'isActive': isActive,
     };
   }
-
-  bool get isAdmin => role == 'ADMIN';
-  bool get isEmployee => role == 'EMPLOYEE';
 }

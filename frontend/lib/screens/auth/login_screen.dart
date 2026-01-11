@@ -33,34 +33,63 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _isLoading = true);
 
     final authProvider = Provider.of<AuthProvider>(context, listen: false);
-    final success = await authProvider.login(
-      _emailController.text.trim(),
-      _passwordController.text,
-    );
 
-    setState(() => _isLoading = false);
-
-    if (success && mounted) {
-      // Navigate based on role
-      if (authProvider.isAdmin) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const AdminDashboardScreen()),
-        );
-      } else {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const EmployeeHomeScreen()),
-        );
-      }
-    } else if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(authProvider.error ?? 'Login failed'),
-          backgroundColor: Colors.red,
-        ),
+    try {
+      final success = await authProvider.login(
+        _emailController.text.trim(),
+        _passwordController.text,
       );
+
+      setState(() => _isLoading = false);
+
+      if (success && mounted) {
+        if (authProvider.isAdmin) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const AdminDashboardScreen()),
+          );
+        } else {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const EmployeeHomeScreen()),
+          );
+        }
+      } else if (mounted) {
+        _showError(authProvider.error ?? "Invalid email or password");
+      }
+    } catch (e) {
+      setState(() => _isLoading = false);
+
+      if (mounted) {
+        _showError(_friendlyError(e.toString()));
+      }
     }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  String _friendlyError(String error) {
+    if (error.contains("Invalid credentials")) {
+      return "Invalid email or password";
+    }
+    if (error.contains("User not found")) {
+      return "Account does not exist";
+    }
+    if (error.contains("Network")) {
+      return "Network error. Please check your connection";
+    }
+    if (error.contains("timeout")) {
+      return "Server timeout. Try again";
+    }
+    return "Login failed. Please try again";
   }
 
   @override
